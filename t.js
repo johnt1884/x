@@ -74,6 +74,8 @@
     // Debug mode (load from localStorage, default to true)
     let DEBUG_MODE = localStorage.getItem(DEBUG_MODE_KEY) === null ? true : localStorage.getItem(DEBUG_MODE_KEY) === 'true';
 
+    const memorySavingMode = localStorage.getItem('otkMemorySavingMediaMode') === 'true';
+
     const consoleLog = (...args) => {
         if (DEBUG_MODE) {
             console.log('[OTK Tracker]', ...args);
@@ -1655,17 +1657,6 @@ function createTweetEmbedElement(tweetId) {
         const messagesContainer = document.createElement('div');
         messagesContainer.id = 'otk-messages-container';
 
-        // Initialize or re-initialize IntersectionObserver for media within this container
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.disconnect(); // Clean up previous observer if any
-            consoleLog('[LazyLoad] Disconnected previous mediaIntersectionObserver.');
-        }
-
-        mediaIntersectionObserver = new IntersectionObserver(handleIntersection, {
-            root: messagesContainer,
-            rootMargin: '0px 0px 300px 0px',
-            threshold: 0.01
-        });
         messagesContainer.style.cssText = `
             position: absolute;
             top: 0;
@@ -1678,6 +1669,17 @@ function createTweetEmbedElement(tweetId) {
             /* width and height are now controlled by absolute positioning */
         `;
         otkViewer.appendChild(messagesContainer);
+
+        // Initialize or re-initialize IntersectionObserver for media within this container
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.disconnect(); // Clean up previous observer if any
+            consoleLog('[LazyLoad] Disconnected previous mediaIntersectionObserver.');
+        }
+        mediaIntersectionObserver = new IntersectionObserver(handleIntersection, {
+            root: messagesContainer,
+            rootMargin: '0px 0px 300px 0px',
+            threshold: 0.01
+        });
 
         const totalMessagesToRender = allMessages.length;
         let messagesProcessedInViewer = 0;
@@ -1793,35 +1795,21 @@ function _populateAttachmentDivWithMedia(
     viewerTopLevelAttachedVideoHashes, // Set for video stats
     otkMediaDB // IndexedDB instance
 ) {
-    // Ensure message.attachment and message.attachment.ext exist before using them
     if (!message.attachment || !message.attachment.ext) {
-        // consoleWarn(" populateAttachmentDivWithMedia: Attachment or extension missing.", message.id);
-        return; // Nothing to process
+        return;
     }
 
     const extLower = message.attachment.ext.toLowerCase();
     const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
+    const memorySavingMode = localStorage.getItem('otkMemorySavingMediaMode') === 'true';
 
     if (['.jpg', '.jpeg', '.png', '.gif'].includes(extLower)) {
-        // --- IMAGE LOGIC ---
         const fullsizeWidth = message.attachment.w;
         const fullsizeHeight = message.attachment.h;
-        const displayWidth = message.attachment.tn_w;
-        const displayHeight = message.attachment.tn_h;
-
-        let defaultToThumbnail;
-
         const maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? 400 : 350;
         const aspectRatio = fullsizeWidth / fullsizeHeight;
         const scaledWidth = maxHeight * aspectRatio;
-
-        // Rule 1: Always display full-size if under certain dimensions
-        if ((scaledWidth <= 570 && maxHeight <= 730) || (scaledWidth <= 2050 && maxHeight <= 530)) {
-            defaultToThumbnail = false;
-        } else {
-            // Rule 2: For all other instances, start with the thumbnail
-            defaultToThumbnail = true;
-        }
+        const defaultToThumbnail = !((scaledWidth <= 570 && maxHeight <= 730) || (scaledWidth <= 2050 && maxHeight <= 530));
 
         const img = document.createElement('img');
         img.dataset.filehash = filehash;
@@ -1837,102 +1825,89 @@ function _populateAttachmentDivWithMedia(
         img.dataset.fullSrc = webFullSrc;
         img.dataset.thumbSrc = webThumbSrc;
 
-        const setImageProperties = () => {
-            if (img.dataset.isThumbnail === 'true') {
+        const setImageProperties = (isThumbnail) => {
+            if (isThumbnail) {
                 img.src = img.dataset.thumbSrc;
                 img.style.width = message.attachment.tn_w + 'px';
                 img.style.height = message.attachment.tn_h + 'px';
                 img.style.maxWidth = ''; img.style.maxHeight = '';
             } else {
-                img.src = img.dataset.fullSrc;
-                img.style.maxWidth = '85%';
-                img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px'; // Adjusted quoted default slightly
-                img.style.width = 'auto'; img.style.height = 'auto';
-            }
-        };
-        setImageProperties();
-
-        img.addEventListener('click', () => {
-            const currentlyThumbnail = img.dataset.isThumbnail === 'true';
-            if (currentlyThumbnail) {
                 img.src = img.dataset.fullSrc;
                 img.style.maxWidth = '85%';
                 img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px';
                 img.style.width = 'auto'; img.style.height = 'auto';
-                img.dataset.isThumbnail = 'false';
-            } else {
-                img.src = img.dataset.thumbSrc;
-                img.style.width = message.attachment.tn_w + 'px';
-                img.style.height = message.attachment.tn_h + 'px';
-                img.style.maxWidth = ''; img.style.maxHeight = '';
-                img.dataset.isThumbnail = 'true';
             }
+        };
+
+        if (memorySavingMode) {
+            setImageProperties(defaultToThumbnail);
+            uniqueImageViewerHashes.add(filehash);
+        } else {
+            if (message.attachment.localStoreId && otkMediaDB) {
+                mediaLoadPromises.push(new Promise((resolveMedia) => {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.get(message.attachment.localStoreId);
+                    request.onsuccess = (event) => {
+                        const storedItem = event.target.result;
+                        if (storedItem && storedItem.blob && !storedItem.isThumbnail) {
+                            const dataURL = URL.createObjectURL(storedItem.blob);
+                            createdBlobUrls.add(dataURL);
+                            img.dataset.fullSrc = dataURL;
+                        }
+                        setImageProperties(defaultToThumbnail);
+                        uniqueImageViewerHashes.add(filehash);
+                        resolveMedia();
+                    };
+                    request.onerror = (event) => {
+                        consoleError(`Error fetching full image ${filehash} from IDB: ${event.target.error}`);
+                        setImageProperties(defaultToThumbnail);
+                        uniqueImageViewerHashes.add(filehash);
+                        resolveMedia();
+                    };
+                }));
+            } else {
+                setImageProperties(defaultToThumbnail);
+                uniqueImageViewerHashes.add(filehash);
+            }
+
+            if (message.attachment.localThumbStoreId && otkMediaDB) {
+                mediaLoadPromises.push(new Promise((resolveMedia) => {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.get(message.attachment.localThumbStoreId);
+                    request.onsuccess = (event) => {
+                        const storedItem = event.target.result;
+                        if (storedItem && storedItem.blob && storedItem.isThumbnail) {
+                            const dataURL = URL.createObjectURL(storedItem.blob);
+                            createdBlobUrls.add(dataURL);
+                            img.dataset.thumbSrc = dataURL;
+                            if (img.dataset.isThumbnail === 'true') img.src = dataURL; // Re-set src if it's currently a thumbnail
+                        }
+                        resolveMedia();
+                    };
+                    request.onerror = (event) => {
+                        consoleError(`Error fetching thumb ${filehash} from IDB: ${event.target.error}`);
+                        resolveMedia();
+                    };
+                }));
+            }
+        }
+
+        img.addEventListener('click', () => {
+            const currentlyThumbnail = img.dataset.isThumbnail === 'true';
+            img.dataset.isThumbnail = currentlyThumbnail ? 'false' : 'true';
+            setImageProperties(!currentlyThumbnail);
         });
 
-        if (message.attachment.localStoreId && otkMediaDB) {
-            mediaLoadPromises.push(new Promise((resolveMedia) => {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(message.attachment.localStoreId);
-                request.onsuccess = (event) => {
-                    const storedItem = event.target.result;
-                    if (storedItem && storedItem.blob && !storedItem.isThumbnail) {
-                        const dataURL = URL.createObjectURL(storedItem.blob);
-                        createdBlobUrls.add(dataURL);
-                        img.dataset.fullSrc = dataURL;
-                        if (img.dataset.isThumbnail === 'false') img.src = dataURL;
-                        uniqueImageViewerHashes.add(filehash);
-                        resolveMedia();
-                    } else {
-                        uniqueImageViewerHashes.add(filehash);
-                        resolveMedia();
-                    }
-                };
-                request.onerror = (event) => {
-                    consoleError(`Error fetching full image ${filehash} from IDB: ${event.target.error}`);
-                    uniqueImageViewerHashes.add(filehash);
-                    resolveMedia();
-                };
-            }));
-        } else {
-            uniqueImageViewerHashes.add(filehash);
-        }
-
-        if (message.attachment.localThumbStoreId && otkMediaDB) {
-            mediaLoadPromises.push(new Promise((resolveMedia) => {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(message.attachment.localThumbStoreId);
-                request.onsuccess = (event) => {
-                    const storedItem = event.target.result;
-                    if (storedItem && storedItem.blob && storedItem.isThumbnail) {
-                        const dataURL = URL.createObjectURL(storedItem.blob);
-                        createdBlobUrls.add(dataURL);
-                        img.dataset.thumbSrc = dataURL;
-                        if (img.dataset.isThumbnail === 'true') img.src = dataURL;
-                        resolveMedia();
-                    } else {
-                        resolveMedia();
-                    }
-                };
-                request.onerror = (event) => {
-                    consoleError(`Error fetching thumb ${filehash} from IDB: ${event.target.error}`);
-                    resolveMedia();
-                };
-            }));
-        }
         attachmentDiv.appendChild(img);
 
     } else if (extLower.endsWith('webm') || extLower.endsWith('mp4')) {
-        // --- VIDEO LOGIC ---
         const setupVideo = (src) => {
             const videoElement = document.createElement('video');
-            if (!message.attachment.tim || !message.attachment.ext) {
-                consoleError(`Video attachment for message ${message.id} is missing 'tim' or 'ext'. Cannot construct video src.`);
-                // Potentially don't append, or append a placeholder? For now, it will have no src.
-            } else {
-                videoElement.src = src || `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`; // Ensure ext has a dot
-            }
+            const webVideoSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
+
+            videoElement.src = src || webVideoSrc;
             videoElement.controls = true;
             videoElement.style.maxWidth = '85%';
             videoElement.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '300px';
@@ -1944,30 +1919,34 @@ function _populateAttachmentDivWithMedia(
             }
         };
 
-        if (message.attachment.localStoreId && otkMediaDB) {
-            mediaLoadPromises.push(new Promise((resolveMedia) => {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(message.attachment.localStoreId);
-                request.onsuccess = (event) => {
-                    const storedItem = event.target.result;
-                    if (storedItem && storedItem.blob) {
-                        const dataURL = URL.createObjectURL(storedItem.blob);
-                        createdBlobUrls.add(dataURL);
-                        setupVideo(dataURL);
-                    } else {
-                        setupVideo(null);
-                    }
-                    resolveMedia();
-                };
-                request.onerror = (event) => {
-                    consoleError(`Error fetching video ${filehash} from IDB: ${event.target.error}`);
-                    setupVideo(null);
-                    resolveMedia();
-                };
-            }));
+        if (memorySavingMode) {
+            setupVideo(null); // Always load from web in memory saving mode
         } else {
-            setupVideo(null);
+            if (message.attachment.localStoreId && otkMediaDB) {
+                mediaLoadPromises.push(new Promise((resolveMedia) => {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.get(message.attachment.localStoreId);
+                    request.onsuccess = (event) => {
+                        const storedItem = event.target.result;
+                        if (storedItem && storedItem.blob) {
+                            const dataURL = URL.createObjectURL(storedItem.blob);
+                            createdBlobUrls.add(dataURL);
+                            setupVideo(dataURL);
+                        } else {
+                            setupVideo(null); // Fallback to web if not in DB
+                        }
+                        resolveMedia();
+                    };
+                    request.onerror = (event) => {
+                        consoleError(`Error fetching video ${filehash} from IDB: ${event.target.error}`);
+                        setupVideo(null); // Fallback to web on error
+                        resolveMedia();
+                    };
+                }));
+            } else {
+                setupVideo(null); // Load from web if no localStoreId
+            }
         }
     }
 }
@@ -1977,6 +1956,12 @@ function _populateAttachmentDivWithMedia(
         const layoutStyle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
         consoleLog(`[DepthCheck] Rendering message: ${message.id}, parent: ${parentMessageId}, currentDepth: ${currentDepth}, MAX_QUOTE_DEPTH: ${MAX_QUOTE_DEPTH}, isTopLevel: ${isTopLevelMessage}, layoutStyle: ${layoutStyle}`);
 
+        let seenEmbeds = [];
+        try {
+            seenEmbeds = JSON.parse(localStorage.getItem(SEEN_EMBED_URL_IDS_KEY)) || [];
+        } catch (e) {
+            consoleError("Error parsing seen embeds from localStorage:", e);
+        }
         let allThemeSettings = {};
         try {
             allThemeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
@@ -2217,12 +2202,6 @@ function _populateAttachmentDivWithMedia(
                                 if (videoId) {
                                     const canonicalEmbedId = `youtube_${videoId}`;
                                     viewerTopLevelEmbedIds.add(canonicalEmbedId); // Simplified tracking
-                                    let seenEmbeds = [];
-                                    try {
-                                        seenEmbeds = JSON.parse(localStorage.getItem(SEEN_EMBED_URL_IDS_KEY)) || [];
-                                    } catch (e) {
-                                        consoleError("Error parsing seen embeds from localStorage:", e);
-                                    }
                                     if (!seenEmbeds.includes(canonicalEmbedId)) { /* ... update stats ... */ }
 
                                     textElement.appendChild(createYouTubeEmbedElement(videoId, timestampStr));
@@ -4778,6 +4757,7 @@ function handleIntersection(entries, observerInstance) {
 
         if (wrapper.dataset.tweetId) { // Handle Tweet embeds
             if (entry.isIntersecting) {
+                console.log(`[LazyLoad] Tweet ${wrapper.dataset.tweetId} is intersecting, processing.`);
                 processTweetEmbed(wrapper);
                 // Once processed, we don't need to observe it anymore.
                 observerInstance.unobserve(wrapper);
@@ -4786,14 +4766,14 @@ function handleIntersection(entries, observerInstance) {
             if (entry.isIntersecting) {
                 // Element is now visible
                 if (iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
-                    consoleLog('[LazyLoad] Loading iframe for:', iframe.dataset.src);
+                    console.log('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
                     iframe.src = iframe.dataset.src;
                 }
             } else {
                 // Element is no longer visible
                 const unloadEnabled = localStorage.getItem('otkUnloadVideos') === 'true';
                 if (unloadEnabled && iframe.src && iframe.src !== 'about:blank') {
-                    consoleLog('[LazyLoad] Unloading iframe (scrolled out of view):', iframe.src);
+                    console.log('[LazyLoad] Iframe is no longer intersecting, unloading src:', iframe.src);
                     if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
                         try {
                             iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
@@ -4866,9 +4846,11 @@ function saveThemeSetting(key, value, requiresRerender = false) {
     }
 }
 
-function applyMainTheme() {
-    const mainTheme = GM.getValue(MAIN_THEME_KEY, null);
-    if (mainTheme) {
+async function applyMainTheme() {
+    const mainTheme = await GM.getValue(MAIN_THEME_KEY, null); // ✅ wait for value
+
+    if (typeof mainTheme === 'string') {
+        console.log("mainlog: Main", mainTheme);
         consoleLog("Applying main theme from GM storage.");
         try {
             let settings = JSON.parse(mainTheme);
@@ -4878,6 +4860,8 @@ function applyMainTheme() {
         } catch (e) {
             consoleError("Error parsing main theme from GM storage:", e);
         }
+    } else {
+        console.warn("No Main theme found in GM storage.");
     }
 }
 
@@ -5904,6 +5888,7 @@ function setupOptionsWindow() {
     themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load Kick Clips:", storageKey: 'otkLazyLoadKick', defaultValue: true, idSuffix: 'lazy-load-kick', requiresRerender: true }));
     themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Unload Videos When Scrolled Past:", storageKey: 'otkUnloadVideos', defaultValue: true, idSuffix: 'unload-videos', requiresRerender: true }));
     themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Disable Tweet Caching:", storageKey: 'otkDisableTweetCaching', defaultValue: false, idSuffix: 'disable-tweet-caching', requiresRerender: true }));
+    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Memory Saving Media Mode:", storageKey: 'otkMemorySavingMediaMode', defaultValue: false, idSuffix: 'memory-saving-media-mode', requiresRerender: true }));
 
     // themeOptionsContainer.appendChild(createDivider()); // Removed divider
 
@@ -6081,14 +6066,16 @@ function setupOptionsWindow() {
         revertOption.textContent = "‹ Active Settings ›"; // Display text
         dropdown.appendChild(revertOption);
 
-        let customThemes = [];
+        let customThemes = {};
         try {
-            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || [];
+            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
         } catch (e) {
             consoleError("Error parsing custom themes from localStorage:", e);
         }
 
-        if (customThemes.length === 0) {
+        const themeNames = Object.keys(customThemes);
+
+        if (themeNames.length === 0) {
             // If no custom themes, the "Revert" option might be confusing or lonely.
             // We can disable it or change its text, or simply let it be.
             // For now, let it be. User can save a theme to make the list more useful.
@@ -6098,10 +6085,10 @@ function setupOptionsWindow() {
             noThemesOption.disabled = true;
             dropdown.appendChild(noThemesOption);
         } else {
-            customThemes.forEach(theme => {
+            themeNames.forEach(themeName => {
                 const option = document.createElement('option');
-                option.value = theme.name; // Actual theme name
-                option.textContent = theme.name;
+                option.value = themeName; // Actual theme name
+                option.textContent = themeName;
                 dropdown.appendChild(option);
             });
         }
@@ -6696,7 +6683,7 @@ async function main() {
     consoleLog("Injected CSS for anchored messages.");
 
     setupOptionsWindow(); // Call to create the options window shell and event listeners
-    applyMainTheme();
+    await applyMainTheme();
     applyThemeSettings(); // Apply any saved theme settings
 
     consoleLog('Attempting to call setupLoadingScreen...');
